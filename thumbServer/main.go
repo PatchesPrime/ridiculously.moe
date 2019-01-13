@@ -76,7 +76,7 @@ func build_thumbnails(filename string) {
 		log.Fatalf("Couldn't get absolute path of {} + {}: {}", *thumbsDirectory, thumb, err)
 	}
 
-	log.Println("Saving ", outPath)
+	// log.Println("INFO| Saving ", outPath)
 
 	if err = imaging.Save(src, outPath); err != nil {
 		log.Fatalf("failed to save image: %v", err)
