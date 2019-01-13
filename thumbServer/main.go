@@ -2,56 +2,20 @@ package main
 
 import (
 	"bufio"
-	"io/ioutil"
+	"flag"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
 
 	"github.com/disintegration/imaging"
+	"strings"
 )
 
-func build_thumbnails(filename string) {
-
-	// Only do things if the file exists, rather than failing hard.
-	_, err := os.Stat(filename)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Fatal("Fatal error getting stat of thumbnail src:", err)
-		} //  else {
-		// 	return
-		// }
-	}
-
-	// Let's trim the input (which we expect to be full path)
-	dir, filename := filepath.Split(filename)
-	if _, err := os.Stat(dir + "thumbs"); err != nil {
-		os.Mkdir(dir+"thumbs", 0755)
-	}
-
-	thumb := filename[:len(filename)-3] + "png"
-	// Only do work if it doesn't exist.
-	_, err = os.Stat(dir + "thumbs/" + thumb)
-	if err != nil {
-		if os.IsNotExist(err) {
-			src, err := imaging.Open(dir + filename)
-			if err != nil {
-				// log.Printf("failed to open %s: %v", filename, err)
-				return
-			}
-
-			src = imaging.Resize(src, 300, 200, imaging.Lanczos)
-
-			if err = imaging.Save(src, dir+"thumbs/"+thumb); err != nil {
-				log.Fatalf("failed to save image: %v", err)
-			}
-			return
-		}
-	}
-
-}
+// Useful startup flags. We should make this into a config.
+var port = flag.String("bind", ":8767", "The binding on which to listen.")
+var maxWorkers = flag.Uint("workers", 25, "Set the max number of concurrently open files.")
+var thumbsDirectory = flag.String("dir", "<src>", "The directory in which to save thumbs. If <src>, use given directory/thumbs/filename.png")
 
 func diff(a, b []os.FileInfo) (out []string) {
 	m := make(map[os.FileInfo]bool)
@@ -71,118 +35,109 @@ func diff(a, b []os.FileInfo) (out []string) {
 	return out
 }
 
-type semaphore chan struct{}
-
-func (o semaphore) Lock() {
-	o <- struct{}{}
-}
-func (o semaphore) Unlock() {
-	<-o
-}
-
-func sendIt(s semaphore, f string) {
-	// Get a semaphore slot, do work, release it.
-	s.Lock()
-	defer s.Unlock()
-	build_thumbnails(f)
-}
-
-func watcher(dir string) {
-	// Use semaphore pattern to control concurrency.
-	// We open lots of files, that needs to be...restricted.
-	// TODO: Abstract away to a struct "Watcher" that combines
-	// functionality for reusing this stuff.
-	sem := make(semaphore, 100) //struct{}, 100)
-	defer close(sem)
-
-	// Begin the work.
-	base, err := os.Stat(dir)
+func build_thumbnails(filename string) {
+	// Only do things if the file exists, rather than failing hard.
+	_, err := os.Stat(filename)
 	if err != nil {
-		log.Fatal("Couldn't stat ", dir)
+		if !os.IsNotExist(err) {
+			log.Fatal("Fatal error getting stat of thumbnail src:", err)
+		}
 	}
+
+	// Let's trim the input (which we expect to be full path)
+	dir, filename := filepath.Split(filename)
+
+	// Let's not break backwards compatibility.
+	if *thumbsDirectory == "<src>" {
+		*thumbsDirectory = dir + "thumbs/"
+	}
+
+	// Add a slash to end if we need to.
+	if !strings.HasSuffix(*thumbsDirectory, "/") {
+		*thumbsDirectory += "/"
+	}
+
+	// Now we return to our regularly scheduled broadcast.
+	if _, err := os.Stat(*thumbsDirectory); err != nil {
+		os.Mkdir(*thumbsDirectory, 0755)
+	}
+
+	thumb := filename[:len(filename)-3] + "png"
+	src, err := imaging.Open(dir + filename)
+	if err != nil {
+		log.Println("Failed to open file for image processing: ", err)
+		return
+	}
+
+	src = imaging.Thumbnail(src, 300, 200, imaging.Lanczos)
+
+	outPath, err := filepath.Abs(*thumbsDirectory + thumb)
+	if err != nil {
+		log.Fatalf("Couldn't get absolute path of {} + {}: {}", *thumbsDirectory, thumb, err)
+	}
+
+	log.Println("Saving ", outPath)
+
+	if err = imaging.Save(src, outPath); err != nil {
+		log.Fatalf("failed to save image: %v", err)
+	}
+}
+
+type Queue chan string
+
+func queueHandler(q Queue, workers uint) {
+	// This will be our limiting semaphore.
+	sem := make(chan struct{}, workers)
+	defer close(sem)
 
 	// We need a "safe" list, but contains is neat. Let's use a map
 	// whos value uses no memory :D
 	safeList := make(map[string]struct{})
-	for _, k := range []string{"png", "jpg", "jpeg"} {
+	for _, k := range []string{".png", ".jpg", ".jpeg"} {
 		safeList[k] = struct{}{}
 	}
 
-	// Build needed items for watching.
-	begin := base.ModTime()
 	for {
-		curr, err := os.Stat(dir)
-		if err != nil {
-			log.Fatal("Couldn't stat inside loop..")
-		}
+		file := <-q
+		// Does the file extention match our safeList?
+		if _, ok := safeList[filepath.Ext(file)]; ok {
+			// Get directory and prepare filename for new format.
+			dir, thumb := filepath.Split(file)
 
-		if curr.ModTime().After(begin) {
-			// Make sure path ends in /
-			if !strings.HasSuffix(dir, "/") {
-				dir = dir + "/"
-			}
+			// The library we use for build_thumbnails saves as the format of our
+			// file extention. It's been requested that we use PNG.
+			thumb = thumb[:len(thumb)-3] + "png"
 
-			base, err := ioutil.ReadDir(dir)
-			if err != nil {
-				log.Fatal("Can't open base dir..")
-			}
-
-			thumbs, err := ioutil.ReadDir(dir + "thumbs")
-			if err != nil {
+			// Let's check if the thumb exists.
+			if _, err := os.Stat(dir + *thumbsDirectory + thumb); err != nil {
 				if os.IsNotExist(err) {
-					os.Mkdir(dir+"thumbs", 0755)
+					sem <- struct{}{}
+					go func() {
+						build_thumbnails(file)
+						defer func() { <-sem }()
+					}()
 				}
 			}
-
-			if len(thumbs) != 0 {
-				new := diff(base, thumbs)
-				for _, f := range new {
-					if _, ok := safeList[f[len(f)-3:]]; !ok {
-						// TODO: We'll have errors one day.
-						continue
-					}
-					// Only do work if it doesn't exist.
-					_, err = os.Stat(dir + "thumbs/" + f[:len(f)-3] + "png")
-					if err != nil {
-						if os.IsNotExist(err) {
-							// Originally was a closure.
-							go sendIt(sem, dir+f)
-						}
-					}
-				}
-			} else {
-				// NOTE: It will not generate thumbnails on first run but
-				// does it here when you add the first new file. If any thumbnails
-				// are missing it will generate those along with the new file.
-				for _, f := range base {
-					if !f.IsDir() {
-						if _, ok := safeList[f.Name()[len(f.Name())-3:]]; !ok {
-							// TODO: We'll have errors one day.
-							continue
-						}
-						go sendIt(sem, dir+f.Name())
-					}
-				}
-			}
-			// Change our begin time to our most recent + 1 second for leeway
-			// Any excess will be caught on next pass
-			begin = curr.ModTime().Add(time.Second)
 		}
 	}
 }
 
 func main() {
+	flag.Parse()
+
+	// A queue doesn't have to be complex..
+	queue := make(Queue)
+	defer close(queue)
+
 	// Build the socket.
-	sock, err := net.Listen("tcp4", ":8766")
+	sock, err := net.Listen("tcp4", *port)
 	if err != nil {
 		log.Fatal("Couldn't open the socket: ", err)
 	}
 	defer sock.Close()
 
-	// This has its own infinite loop in that. We shold change it.
-	if len(os.Args) > 1 {
-		go watcher(os.Args[1])
-	}
+	// TODO: Don't be such a dirty boii
+	go queueHandler(queue, *maxWorkers)
 
 	for {
 		client, err := sock.Accept()
@@ -190,13 +145,15 @@ func main() {
 			log.Fatal("Socket could not accept client: ", err)
 		}
 
+		log.Println("INFO| accepted", client.RemoteAddr())
+
 		go func(c net.Conn) {
 			// TODO: stuff here
 			scanner := bufio.NewScanner(c)
 
 			for scanner.Scan() {
-				filename := scanner.Text()
-				go build_thumbnails(filename)
+				text := scanner.Text()
+				queue <- text
 			}
 		}(client)
 	}
