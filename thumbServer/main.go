@@ -52,11 +52,6 @@ func build_thumbnails(filename string) {
 		*thumbsDirectory = dir + "thumbs/"
 	}
 
-	// Add a slash to end if we need to.
-	if !strings.HasSuffix(*thumbsDirectory, "/") {
-		*thumbsDirectory += "/"
-	}
-
 	// Now we return to our regularly scheduled broadcast.
 	if _, err := os.Stat(*thumbsDirectory); err != nil {
 		os.Mkdir(*thumbsDirectory, 0755)
@@ -101,15 +96,26 @@ func queueHandler(q Queue, workers uint) {
 		file := <-q
 		// Does the file extention match our safeList?
 		if _, ok := safeList[filepath.Ext(file)]; ok {
-			// Get directory and prepare filename for new format.
+			// Prepare filename for new format.
 			dir, thumb := filepath.Split(file)
 
 			// The library we use for build_thumbnails saves as the format of our
 			// file extention. It's been requested that we use PNG.
 			thumb = thumb[:len(thumb)-3] + "png"
 
+			// Let's not break backwards compatibility.
+			if *thumbsDirectory == "<src>" {
+				*thumbsDirectory = dir + "thumbs/"
+			}
+
+			// Get the absolute path
+			thumbnailPath, err := filepath.Abs(*thumbsDirectory + thumb)
+			if err != nil {
+				log.Fatalf("Couldn't get absolute path of {} + {}: {}", *thumbsDirectory, thumb, err)
+			}
+
 			// Let's check if the thumb exists.
-			if _, err := os.Stat(dir + *thumbsDirectory + thumb); err != nil {
+			if _, err := os.Stat(thumbnailPath); err != nil {
 				if os.IsNotExist(err) {
 					sem <- struct{}{}
 					go func() {
@@ -124,6 +130,11 @@ func queueHandler(q Queue, workers uint) {
 
 func main() {
 	flag.Parse()
+
+	// Add a slash to end if we need to.
+	if !strings.HasSuffix(*thumbsDirectory, "/") {
+		*thumbsDirectory += "/"
+	}
 
 	// A queue doesn't have to be complex..
 	queue := make(Queue)
